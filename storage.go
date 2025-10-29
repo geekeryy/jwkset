@@ -334,3 +334,131 @@ func NewStorageFromHTTP(remoteJWKSetURL string, options HTTPClientStorageOptions
 
 	return s, nil
 }
+
+type CustomStorageOptions struct {
+	// Ctx is used when performing HTTP requests. It is also used to end the refresh goroutine when it's no longer
+	// needed.
+	//
+	// This defaults to context.Background().
+	Ctx context.Context
+
+	// NoErrorReturnFirstHTTPReq will create the Storage without error if the first HTTP request fails.
+	NoErrorReturnFirstHTTPReq bool
+
+	// RefreshErrorHandler is a function that consumes errors that happen during an HTTP refresh. This is only effectual
+	// if RefreshInterval is set.
+	//
+	// If NoErrorReturnFirstHTTPReq is set, this function will be called when if the first HTTP request fails.
+	RefreshErrorHandler func(ctx context.Context, err error)
+
+	// RefreshInterval is the interval at which the HTTP URL is refreshed and the JWK Set is processed. This option will
+	// launch a "refresh goroutine" to refresh the remote HTTP resource at the given interval.
+	//
+	// Provide the Ctx option to end the goroutine when it's no longer needed.
+	RefreshInterval time.Duration
+
+	// RequireSupportedKeys will refuse to process a JWK Set if it contains an unsupported key. If false, unsupported
+	// keys, like Ed448, will be ignored.
+	RequireSupportedKeys bool
+
+	// Storage is the underlying storage implementation to use.
+	//
+	// This defaults to NewMemoryStorage().
+	Storage Storage
+
+	// ValidateOptions are the options to use when validating the JWKs.
+	ValidateOptions JWKValidateOptions
+
+	// RequestJWKSetFunc is a function that requests the JWK Set from the remote HTTP resource.
+	RequestJWKSetFunc func(ctx context.Context) (JWKSMarshal, error)
+
+	// RequestJWKSetTimeout is the timeout for the request to the JWK Set.
+	RequestJWKSetTimeout time.Duration
+}
+
+type customStorage struct {
+	options CustomStorageOptions
+	refresh func(ctx context.Context) error
+	Storage
+}
+
+func NewCustomStorage(requestJWKSetFunc func(ctx context.Context) (JWKSMarshal, error), options CustomStorageOptions) (Storage, error) {
+	if options.Ctx == nil {
+		options.Ctx = context.Background()
+	}
+	if options.RequestJWKSetTimeout == 0 {
+		options.RequestJWKSetTimeout = time.Minute
+	}
+	store := options.Storage
+	if store == nil {
+		store = NewMemoryStorage()
+	}
+
+	refresh := func(ctx context.Context) error {
+		jwks, err := requestJWKSetFunc(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get JWK Set: %w", err)
+		}
+		newSet := make([]JWK, 0)
+		for _, marshal := range jwks.Keys {
+			marshalOptions := JWKMarshalOptions{
+				Private: true,
+			}
+			jwk, err := NewJWKFromMarshal(marshal, marshalOptions, options.ValidateOptions)
+			switch {
+			case !options.RequireSupportedKeys && errors.Is(err, ErrUnsupportedKey):
+				continue
+			case err != nil:
+				return fmt.Errorf("failed to create JWK from JWK Marshal: %w", err)
+			}
+			newSet = append(newSet, jwk)
+		}
+		err = store.KeyReplaceAll(ctx, newSet) // Clear local cache in case of key revocation.
+		if err != nil {
+			return fmt.Errorf("failed to delete all keys from storage: %w", err)
+		}
+		return nil
+	}
+
+	if options.RefreshInterval != 0 {
+		go func() { // Refresh goroutine.
+			ticker := time.NewTicker(options.RefreshInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-options.Ctx.Done():
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(options.Ctx, options.RequestJWKSetTimeout)
+					err := refresh(ctx)
+					cancel()
+					if err != nil && options.RefreshErrorHandler != nil {
+						options.RefreshErrorHandler(ctx, err)
+					}
+				}
+			}
+		}()
+	}
+
+	s := customStorage{
+		options: options,
+		refresh: refresh,
+		Storage: store,
+	}
+
+	ctx, cancel := context.WithTimeout(options.Ctx, options.RequestJWKSetTimeout)
+	defer cancel()
+	err := refresh(ctx)
+	cancel()
+	if err != nil {
+		if options.NoErrorReturnFirstHTTPReq {
+			if options.RefreshErrorHandler != nil {
+				options.RefreshErrorHandler(ctx, err)
+			}
+			return s, nil
+		}
+		return nil, fmt.Errorf("failed to perform first HTTP request for JWK Set: %w", err)
+	}
+
+	return s, nil
+}
