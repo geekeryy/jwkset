@@ -51,6 +51,12 @@ type Storage interface {
 	MarshalWithOptions(ctx context.Context, marshalOptions JWKMarshalOptions, validationOptions JWKValidateOptions) (JWKSMarshal, error)
 }
 
+// RefreshableStorage is a Storage that can be refreshed.
+type RefreshableStorage interface {
+	Storage
+	Refresh(ctx context.Context) error
+}
+
 var _ Storage = &MemoryJWKSet{}
 
 type MemoryJWKSet struct {
@@ -215,11 +221,13 @@ type HTTPClientStorageOptions struct {
 
 	// ValidateOptions are the options to use when validating the JWKs.
 	ValidateOptions JWKValidateOptions
+
+	// RemoteJWKSetURL is the URL of the remote JWK Set.
+	RemoteJWKSetURL string
 }
 
 type httpStorage struct {
 	options HTTPClientStorageOptions
-	refresh func(ctx context.Context) error
 	Storage
 }
 
@@ -243,53 +251,20 @@ func NewStorageFromHTTP(remoteJWKSetURL string, options HTTPClientStorageOptions
 	if options.HTTPMethod == "" {
 		options.HTTPMethod = http.MethodGet
 	}
+	if options.RemoteJWKSetURL == "" {
+		options.RemoteJWKSetURL = remoteJWKSetURL
+	}
 	store := options.Storage
 	if store == nil {
 		store = NewMemoryStorage()
 	}
-	_, err := url.ParseRequestURI(remoteJWKSetURL)
+	_, err := url.ParseRequestURI(options.RemoteJWKSetURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse given URL %q: %w", remoteJWKSetURL, err)
+		return nil, fmt.Errorf("failed to parse given URL %q: %w", options.RemoteJWKSetURL, err)
 	}
-
-	refresh := func(ctx context.Context) error {
-		req, err := http.NewRequestWithContext(ctx, options.HTTPMethod, remoteJWKSetURL, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create HTTP request for JWK Set refresh: %w", err)
-		}
-		resp, err := options.Client.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed to perform HTTP request for JWK Set refresh: %w", err)
-		}
-		//goland:noinspection GoUnhandledErrorResult
-		defer resp.Body.Close()
-		if resp.StatusCode != options.HTTPExpectedStatus {
-			return fmt.Errorf("%w: %d", ErrInvalidHTTPStatusCode, resp.StatusCode)
-		}
-		var jwks JWKSMarshal
-		err = json.NewDecoder(resp.Body).Decode(&jwks)
-		if err != nil {
-			return fmt.Errorf("failed to decode JWK Set response: %w", err)
-		}
-		newSet := make([]JWK, 0)
-		for _, marshal := range jwks.Keys {
-			marshalOptions := JWKMarshalOptions{
-				Private: true,
-			}
-			jwk, err := NewJWKFromMarshal(marshal, marshalOptions, options.ValidateOptions)
-			switch {
-			case !options.RequireSupportedKeys && errors.Is(err, ErrUnsupportedKey):
-				continue
-			case err != nil:
-				return fmt.Errorf("failed to create JWK from JWK Marshal: %w", err)
-			}
-			newSet = append(newSet, jwk)
-		}
-		err = store.KeyReplaceAll(ctx, newSet) // Clear local cache in case of key revocation.
-		if err != nil {
-			return fmt.Errorf("failed to delete all keys from storage: %w", err)
-		}
-		return nil
+	s := httpStorage{
+		options: options,
+		Storage: store,
 	}
 
 	if options.RefreshInterval != 0 {
@@ -302,7 +277,7 @@ func NewStorageFromHTTP(remoteJWKSetURL string, options HTTPClientStorageOptions
 					return
 				case <-ticker.C:
 					ctx, cancel := context.WithTimeout(options.Ctx, options.HTTPTimeout)
-					err := refresh(ctx)
+					err := s.Refresh(ctx)
 					cancel()
 					if err != nil && options.RefreshErrorHandler != nil {
 						options.RefreshErrorHandler(ctx, err)
@@ -312,15 +287,9 @@ func NewStorageFromHTTP(remoteJWKSetURL string, options HTTPClientStorageOptions
 		}()
 	}
 
-	s := httpStorage{
-		options: options,
-		refresh: refresh,
-		Storage: store,
-	}
-
 	ctx, cancel := context.WithTimeout(options.Ctx, options.HTTPTimeout)
 	defer cancel()
-	err = refresh(ctx)
+	err = s.Refresh(ctx)
 	cancel()
 	if err != nil {
 		if options.NoErrorReturnFirstHTTPReq {
@@ -335,24 +304,73 @@ func NewStorageFromHTTP(remoteJWKSetURL string, options HTTPClientStorageOptions
 	return s, nil
 }
 
+func (s *httpStorage) Refresh(ctx context.Context) error {
+	err := s.refresh(ctx)
+	if err != nil && s.options.RefreshErrorHandler != nil {
+		s.options.RefreshErrorHandler(ctx, err)
+		return nil
+	}
+	return err
+}
+
+func (s *httpStorage) refresh(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, s.options.HTTPMethod, s.options.RemoteJWKSetURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request for JWK Set refresh: %w", err)
+	}
+	resp, err := s.options.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to perform HTTP request for JWK Set refresh: %w", err)
+	}
+	//goland:noinspection GoUnhandledErrorResult
+	defer resp.Body.Close()
+	if resp.StatusCode != s.options.HTTPExpectedStatus {
+		return fmt.Errorf("%w: %d", ErrInvalidHTTPStatusCode, resp.StatusCode)
+	}
+	var jwks JWKSMarshal
+	err = json.NewDecoder(resp.Body).Decode(&jwks)
+	if err != nil {
+		return fmt.Errorf("failed to decode JWK Set response: %w", err)
+	}
+	newSet := make([]JWK, 0)
+	for _, marshal := range jwks.Keys {
+		marshalOptions := JWKMarshalOptions{
+			Private: true,
+		}
+		jwk, err := NewJWKFromMarshal(marshal, marshalOptions, s.options.ValidateOptions)
+		switch {
+		case !s.options.RequireSupportedKeys && errors.Is(err, ErrUnsupportedKey):
+			continue
+		case err != nil:
+			return fmt.Errorf("failed to create JWK from JWK Marshal: %w", err)
+		}
+		newSet = append(newSet, jwk)
+	}
+	err = s.Storage.KeyReplaceAll(ctx, newSet) // Clear local cache in case of key revocation.
+	if err != nil {
+		return fmt.Errorf("failed to delete all keys from storage: %w", err)
+	}
+	return nil
+}
+
 type CustomStorageOptions struct {
-	// Ctx is used when performing HTTP requests. It is also used to end the refresh goroutine when it's no longer
+	// Ctx is used when performing requests. It is also used to end the refresh goroutine when it's no longer
 	// needed.
 	//
 	// This defaults to context.Background().
 	Ctx context.Context
 
-	// NoErrorReturnFirstHTTPReq will create the Storage without error if the first HTTP request fails.
-	NoErrorReturnFirstHTTPReq bool
+	// NoErrorReturnFirstReq will create the Storage without error if the first request fails.
+	NoErrorReturnFirstReq bool
 
-	// RefreshErrorHandler is a function that consumes errors that happen during an HTTP refresh. This is only effectual
+	// RefreshErrorHandler is a function that consumes errors that happen during a refresh. This is only effectual
 	// if RefreshInterval is set.
 	//
-	// If NoErrorReturnFirstHTTPReq is set, this function will be called when if the first HTTP request fails.
+	// If NoErrorReturnFirstReq is set, this function will be called when if the first request fails.
 	RefreshErrorHandler func(ctx context.Context, err error)
 
-	// RefreshInterval is the interval at which the HTTP URL is refreshed and the JWK Set is processed. This option will
-	// launch a "refresh goroutine" to refresh the remote HTTP resource at the given interval.
+	// RefreshInterval is the interval at which the request is refreshed and the JWK Set is processed. This option will
+	// launch a "refresh goroutine" to refresh the request at the given interval.
 	//
 	// Provide the Ctx option to end the goroutine when it's no longer needed.
 	RefreshInterval time.Duration
@@ -369,7 +387,7 @@ type CustomStorageOptions struct {
 	// ValidateOptions are the options to use when validating the JWKs.
 	ValidateOptions JWKValidateOptions
 
-	// RequestJWKSetFunc is a function that requests the JWK Set from the remote HTTP resource.
+	// RequestJWKSetFunc is a function that requests the JWK Set from the remote resource.
 	RequestJWKSetFunc func(ctx context.Context) (JWKSMarshal, error)
 
 	// RequestJWKSetTimeout is the timeout for the request to the JWK Set.
@@ -378,7 +396,6 @@ type CustomStorageOptions struct {
 
 type customStorage struct {
 	options CustomStorageOptions
-	refresh func(ctx context.Context) error
 	Storage
 }
 
@@ -394,30 +411,9 @@ func NewCustomStorage(requestJWKSetFunc func(ctx context.Context) (JWKSMarshal, 
 		store = NewMemoryStorage()
 	}
 
-	refresh := func(ctx context.Context) error {
-		jwks, err := requestJWKSetFunc(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get JWK Set: %w", err)
-		}
-		newSet := make([]JWK, 0)
-		for _, marshal := range jwks.Keys {
-			marshalOptions := JWKMarshalOptions{
-				Private: true,
-			}
-			jwk, err := NewJWKFromMarshal(marshal, marshalOptions, options.ValidateOptions)
-			switch {
-			case !options.RequireSupportedKeys && errors.Is(err, ErrUnsupportedKey):
-				continue
-			case err != nil:
-				return fmt.Errorf("failed to create JWK from JWK Marshal: %w", err)
-			}
-			newSet = append(newSet, jwk)
-		}
-		err = store.KeyReplaceAll(ctx, newSet) // Clear local cache in case of key revocation.
-		if err != nil {
-			return fmt.Errorf("failed to delete all keys from storage: %w", err)
-		}
-		return nil
+	s := customStorage{
+		options: options,
+		Storage: store,
 	}
 
 	if options.RefreshInterval != 0 {
@@ -430,7 +426,7 @@ func NewCustomStorage(requestJWKSetFunc func(ctx context.Context) (JWKSMarshal, 
 					return
 				case <-ticker.C:
 					ctx, cancel := context.WithTimeout(options.Ctx, options.RequestJWKSetTimeout)
-					err := refresh(ctx)
+					err := s.Refresh(ctx)
 					cancel()
 					if err != nil && options.RefreshErrorHandler != nil {
 						options.RefreshErrorHandler(ctx, err)
@@ -440,25 +436,54 @@ func NewCustomStorage(requestJWKSetFunc func(ctx context.Context) (JWKSMarshal, 
 		}()
 	}
 
-	s := customStorage{
-		options: options,
-		refresh: refresh,
-		Storage: store,
-	}
-
 	ctx, cancel := context.WithTimeout(options.Ctx, options.RequestJWKSetTimeout)
 	defer cancel()
-	err := refresh(ctx)
+	err := s.Refresh(ctx)
 	cancel()
 	if err != nil {
-		if options.NoErrorReturnFirstHTTPReq {
+		if options.NoErrorReturnFirstReq {
 			if options.RefreshErrorHandler != nil {
 				options.RefreshErrorHandler(ctx, err)
 			}
 			return s, nil
 		}
-		return nil, fmt.Errorf("failed to perform first HTTP request for JWK Set: %w", err)
+		return nil, fmt.Errorf("failed to perform first request for JWK Set: %w", err)
 	}
 
 	return s, nil
+}
+
+func (s *customStorage) Refresh(ctx context.Context) error {
+	err := s.refresh(ctx)
+	if err != nil && s.options.RefreshErrorHandler != nil {
+		s.options.RefreshErrorHandler(ctx, err)
+		return nil
+	}
+	return err
+}
+
+func (s *customStorage) refresh(ctx context.Context) error {
+	jwks, err := s.options.RequestJWKSetFunc(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get JWK Set: %w", err)
+	}
+	newSet := make([]JWK, 0)
+	for _, marshal := range jwks.Keys {
+		marshalOptions := JWKMarshalOptions{
+			Private: true,
+		}
+		jwk, err := NewJWKFromMarshal(marshal, marshalOptions, s.options.ValidateOptions)
+		switch {
+		case !s.options.RequireSupportedKeys && errors.Is(err, ErrUnsupportedKey):
+			continue
+		case err != nil:
+			return fmt.Errorf("failed to create JWK from JWK Marshal: %w", err)
+		}
+		newSet = append(newSet, jwk)
+	}
+	err = s.Storage.KeyReplaceAll(ctx, newSet) // Clear local cache in case of key revocation.
+	if err != nil {
+		return fmt.Errorf("failed to delete all keys from storage: %w", err)
+	}
+	return nil
 }
