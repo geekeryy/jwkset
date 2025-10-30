@@ -399,7 +399,7 @@ type customStorage struct {
 	Storage
 }
 
-func NewCustomStorage(requestJWKSetFunc func(ctx context.Context) (JWKSMarshal, error), options CustomStorageOptions) (Storage, error) {
+func NewCustomStorage(options CustomStorageOptions) (Storage, error) {
 	if options.Ctx == nil {
 		options.Ctx = context.Background()
 	}
@@ -410,7 +410,9 @@ func NewCustomStorage(requestJWKSetFunc func(ctx context.Context) (JWKSMarshal, 
 	if store == nil {
 		store = NewMemoryStorage()
 	}
-
+	if options.RequestJWKSetFunc == nil {
+		return nil, fmt.Errorf("request JWK Set func is required")
+	}
 	s := customStorage{
 		options: options,
 		Storage: store,
