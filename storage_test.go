@@ -286,7 +286,9 @@ func TestCustomStorage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	store, err := NewCustomStorage(getJWKSFromHTTP(server.URL), CustomStorageOptions{})
+	store, err := NewCustomStorage(CustomStorageOptions{
+		RequestJWKSetFunc: getJWKSFromHTTP(server.URL),
+	})
 	if err != nil {
 		t.Fatalf("Failed to create custom storage: %s", err)
 	}
