@@ -1,4 +1,4 @@
-module github.com/MicahParks/jwkset
+module github.com/geekeryy/jwkset
 
 go 1.21
 
